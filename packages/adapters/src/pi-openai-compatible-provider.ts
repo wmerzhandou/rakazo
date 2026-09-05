@@ -30,8 +30,8 @@ export { OPENAI_COMPATIBLE_PROVIDER_ID };
 /** Placeholder catalog model id; users enter the real id when connecting. */
 export const OPENAI_COMPATIBLE_CATALOG_MODEL_ID = "custom";
 
-const DEFAULT_CONTEXT_WINDOW = 32_768;
-const DEFAULT_MAX_TOKENS = 4_096;
+const DEFAULT_CONTEXT_WINDOW = 262_144;
+const DEFAULT_MAX_TOKENS = 65_536;
 const MAX_MODELS_RESPONSE_BYTES = 64 * 1024;
 const MAX_MODEL_IDS = 500;
 const MAX_MODEL_ID_LENGTH = 256;
@@ -48,7 +48,7 @@ function openAiCompatibleModel(id: string, baseUrl: string): Model<"openai-compl
     provider: OPENAI_COMPATIBLE_PROVIDER_ID,
     baseUrl,
     reasoning: false,
-    input: ["text"],
+    input: ["text", "image"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: DEFAULT_CONTEXT_WINDOW,
     maxTokens: DEFAULT_MAX_TOKENS,

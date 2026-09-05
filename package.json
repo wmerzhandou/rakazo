@@ -45,7 +45,8 @@
       "react-dom": "19.2.3"
     },
     "patchedDependencies": {
-      "app-builder-lib@26.15.3": "patches/app-builder-lib@26.15.3.patch"
+      "app-builder-lib@26.15.3": "patches/app-builder-lib@26.15.3.patch",
+      "@earendil-works/pi-ai@0.84.3": "patches/@earendil-works__pi-ai@0.84.3.patch"
     }
   }
 }
