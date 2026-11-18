@@ -73,6 +73,10 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends && apt-get inst
     fonts-noto-cjk \
     fonts-noto-color-emoji \
     fonts-thai-tlwg \
+    fcitx5 \
+    fcitx5-chinese-addons \
+    fcitx5-frontend-gtk3 \
+    im-config \
     locales \
     dbus-x11 \
     xdg-desktop-portal \
@@ -186,6 +190,11 @@ ENV HOME=/home/rakazo
 # that override the computer environment can opt in to a Chinese locale.
 RUN sed -i 's/^# zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen && locale-gen
 ENV LANG=C.UTF-8
+# fcitx5 input method (Chinese pinyin via fcitx5-chinese-addons). XIM covers
+# non-GTK/Qt apps; chromium picks fcitx up through the GTK3 im module.
+ENV GTK_IM_MODULE=fcitx \
+    QT_IM_MODULE=fcitx \
+    XMODIFIERS=@im=fcitx
 ENV UV_TOOL_DIR=/home/rakazo/.local/share/uv/tools \
     UV_TOOL_BIN_DIR=/home/rakazo/.local/bin \
     UV_PYTHON_INSTALL_DIR=/home/rakazo/.local/share/uv/python

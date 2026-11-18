@@ -71,6 +71,33 @@ if [ -x /usr/libexec/xdg-desktop-portal ] && [ -x /usr/libexec/xdg-desktop-porta
   /usr/libexec/xdg-desktop-portal-gtk >/tmp/rakazo/portal-gtk.log 2>&1 &
 fi
 
+# fcitx5 (Chinese pinyin) needs the session bus, so start it after dbus-launch.
+# The home volume is empty on first boot, so seed a profile with pinyin as the
+# default IM; fcitx5's own first-run profile would be locale-dependent.
+if command -v fcitx5 >/dev/null 2>&1; then
+  if [ ! -f "$AGENT_HOME/.config/fcitx5/profile" ]; then
+    mkdir -p "$AGENT_HOME/.config/fcitx5"
+    cat > "$AGENT_HOME/.config/fcitx5/profile" <<'EOF'
+[Groups/0]
+Name=Default
+Default Layout=us
+DefaultIM=pinyin
+
+[Groups/0/Items/0]
+Name=keyboard-us
+Layout=
+
+[Groups/0/Items/1]
+Name=pinyin
+Layout=
+
+[GroupOrder]
+0=Default
+EOF
+  fi
+  fcitx5 -d --replace >/tmp/rakazo/fcitx5.log 2>&1 &
+fi
+
 xsetroot -solid "#111113" >/dev/null 2>&1 || true
 mkdir -p /tmp/fluxbox-home/.fluxbox
 cp /etc/rakazo/fluxbox/init /tmp/fluxbox-home/.fluxbox/init
