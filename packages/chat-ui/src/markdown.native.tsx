@@ -1,161 +1,141 @@
+import type { ColorTokens, ResolvedAppearance } from "@rakazo/ui-tokens";
+import { darkTokens } from "@rakazo/ui-tokens";
+import type { ASTNode, RenderRules } from "@ronradtke/react-native-markdown-display";
 import Markdown, {
+  createMarkdownIt,
+  renderRules as libraryRenderRules,
   MarkdownStream,
-  type RenderRules,
 } from "@ronradtke/react-native-markdown-display";
-import { memo } from "react";
-import { Linking, StyleSheet, Text, View } from "react-native";
+import { memo, useMemo } from "react";
+import { Text, View } from "react-native";
 import type { ChatMarkdownProps } from "./markdown";
-import { sanitizeMarkdownUrl } from "./markdown";
+import { LinkFaviconsPausedContext, linkifyExplicitUrls } from "./markdown";
+import { InlineChipsContext } from "./native/chips";
+import { DiagramSurfaceContext } from "./native/code";
+import { OpenLinkContext, useNativeLinkConfirm } from "./native/links";
+import { markTaskListItems } from "./native/lists";
+import { renderRules } from "./native/render-rules";
+import { layout, markdownStyles } from "./native/styles";
 
-const styles = StyleSheet.create({
-  body: {
-    color: "#DFDFE2",
-    fontSize: 15.5,
-    lineHeight: 23,
-    width: "100%",
-    minWidth: 0,
-    flexShrink: 1,
-  },
-  paragraph: {
-    marginTop: 0,
-    marginBottom: 9,
-    width: "100%",
-    flexShrink: 1,
-  },
-  heading1: {
-    color: "#F3F3F4",
-    fontSize: 21,
-    lineHeight: 27,
-    marginTop: 10,
-    marginBottom: 5,
-  },
-  heading2: {
-    color: "#F3F3F4",
-    fontSize: 19,
-    lineHeight: 25,
-    marginTop: 10,
-    marginBottom: 5,
-  },
-  heading3: {
-    color: "#F3F3F4",
-    fontSize: 17,
-    lineHeight: 23,
-    marginTop: 8,
-    marginBottom: 4,
-  },
-  strong: {
-    color: "#F3F3F4",
-    fontWeight: "700",
-  },
-  link: {
-    color: "#86B7FF",
-    textDecorationLine: "underline",
-    marginBottom: 0,
-  },
-  code_inline: {
-    color: "#ECECEE",
-    backgroundColor: "#101012",
-    borderColor: "#34343A",
-    borderWidth: StyleSheet.hairlineWidth,
-    padding: 0,
-    paddingHorizontal: 4,
-    paddingVertical: 1,
-    borderRadius: 4,
-  },
-  code_block: {
-    color: "#ECECEE",
-    backgroundColor: "#0E0E10",
-    borderColor: "#2D2D32",
-  },
-  fence: {
-    backgroundColor: "#0E0E10",
-    borderColor: "#2D2D32",
-  },
-  fence_code: {
-    backgroundColor: "#0E0E10",
-  },
-  blockquote: {
-    backgroundColor: "transparent",
-    borderLeftColor: "#55555C",
-  },
-  table: {
-    borderColor: "#34343A",
-  },
-  tr: {
-    borderColor: "#34343A",
-  },
-  hr: {
-    backgroundColor: "#34343A",
-  },
-  bullet_list_content: {
-    flex: 1,
-    flexShrink: 1,
-    minWidth: 0,
-  },
-  ordered_list_content: {
-    flex: 1,
-    flexShrink: 1,
-    minWidth: 0,
-  },
-});
-
-async function openSafeLink(url: string) {
-  const safeUrl = sanitizeMarkdownUrl(url);
-  if (!safeUrl) return;
-  if (await Linking.canOpenURL(safeUrl)) await Linking.openURL(safeUrl);
+function keepMarkdownLinkToken(_url: string) {
+  return true;
 }
 
-// Keep links as Text so they stay inside textgroup; Pressable (a View) is laid out
-// outside the text flow and collapses the bubble height, overlapping later messages.
-const renderRules: RenderRules = {
-  link: (node, children, _parent, styleMap) => (
-    <Text
-      accessibilityRole="link"
-      key={node.key}
-      style={styleMap.link}
-      onPress={() => {
-        void openSafeLink(node.attributes.href ?? "");
-      }}
-    >
-      {children}
-    </Text>
-  ),
-};
+// One shared parser: the Markdown components memoize on its identity.
+const markdownParser = createMarkdownIt();
+markdownParser.validateLink = keepMarkdownLinkToken;
+linkifyExplicitUrls(markdownParser);
+markTaskListItems(markdownParser);
+
+/** A node's place in the tree, which stays the same when the same Markdown is parsed again. */
+function markdownNodeKey(node: ASTNode, parents: readonly ASTNode[]): string {
+  let path = `${node.index}`;
+  for (const parent of parents) path = `${parent.index}.${path}`;
+  return `${path}_${node.type}`;
+}
+
+/**
+ * The library keys every node afresh on each parse, so each re-render (every streamed chunk)
+ * remounted and re-measured the whole message. Keying nodes by place keeps unchanged blocks.
+ */
+function withPlaceKeys(rules: RenderRules): RenderRules {
+  return Object.fromEntries(
+    Object.entries(rules).map(([type, rule]) => [
+      type,
+      rule &&
+        ((node, children, parents, ...extra) => {
+          node.key = markdownNodeKey(node, parents);
+          return rule(node, children, parents, ...extra);
+        }),
+    ]),
+  );
+}
+
+let chatRenderRules: { text: typeof Text; rules: RenderRules } | undefined;
+
+// Built from the current Text, which the app replaces after this file loads.
+function placeKeyedRenderRules(): RenderRules {
+  if (chatRenderRules?.text !== Text) {
+    chatRenderRules = {
+      text: Text,
+      rules: withPlaceKeys({ ...libraryRenderRules(Text), ...renderRules }),
+    };
+  }
+  return chatRenderRules.rules;
+}
+
+/** The code of each fenced or indented block in a message, as its copy button copies it. */
+export function markdownCodeBlocks(markdown: string): string[] {
+  const tokens: { type: string; content: string }[] = markdownParser.parse(markdown, {});
+  return tokens
+    .filter((token) => token.type === "fence" || token.type === "code_block")
+    .map((token) => token.content.replace(/\n$/, ""))
+    .filter((code) => /\S/.test(code));
+}
 
 export const ChatMarkdown = memo(function ChatMarkdown({
   children,
   streaming = false,
-}: ChatMarkdownProps) {
+  renderMention,
+  onOpenPage,
+  palette = darkTokens,
+  colorScheme = "dark",
+}: ChatMarkdownProps & { palette?: ColorTokens; colorScheme?: ResolvedAppearance }) {
+  const openLink = useNativeLinkConfirm();
+  const styles = useMemo(() => markdownStyles(palette), [palette]);
+  const diagramSurface = useMemo(
+    () => ({ streaming, palette, colorScheme }),
+    [streaming, palette, colorScheme],
+  );
   const sharedProps = {
-    colorScheme: "dark" as const,
+    colorScheme,
+    markdownit: markdownParser,
     style: styles,
-    rules: renderRules,
-    allowedImageHandlers: ["https://", "http://"],
+    rules: placeKeyedRenderRules(),
     onLinkPress: (url: string) => {
-      void openSafeLink(url);
+      openLink(url);
       return false;
     },
   };
 
+  const inlineChips = useMemo(
+    () => ({ renderMention, onOpenPage, palette }),
+    [renderMention, onOpenPage, palette],
+  );
   return (
-    <View style={layout.wrap}>
-      {streaming ? (
-        <MarkdownStream {...sharedProps} cursorColor="#85858A" streaming>
-          {children}
-        </MarkdownStream>
-      ) : (
-        <Markdown {...sharedProps}>{children}</Markdown>
-      )}
-    </View>
+    <OpenLinkContext.Provider value={openLink}>
+      <InlineChipsContext.Provider value={inlineChips}>
+        <View style={layout.wrap}>
+          <LinkFaviconsPausedContext.Provider value={streaming}>
+            <DiagramSurfaceContext.Provider value={diagramSurface}>
+              {streaming ? (
+                <MarkdownStream {...sharedProps} cursorColor={palette.mutedForeground} streaming>
+                  {children}
+                </MarkdownStream>
+              ) : (
+                <Markdown {...sharedProps}>{children}</Markdown>
+              )}
+            </DiagramSurfaceContext.Provider>
+          </LinkFaviconsPausedContext.Provider>
+        </View>
+      </InlineChipsContext.Provider>
+    </OpenLinkContext.Provider>
   );
 });
 
-const layout = StyleSheet.create({
-  wrap: {
-    width: "100%",
-    minWidth: 0,
-    flexShrink: 1,
-  },
-});
-
-export type { ChatMarkdownProps } from "./markdown";
+export type { ChatMarkdownProps, LinkFavicons } from "./markdown";
+export {
+  LinkFaviconsContext,
+  plainTextLinkParts,
+  RemoteImagesContext,
+  useLinkFavicon,
+  withBlockMentions,
+} from "./markdown";
+export { MarkdownLinkPromptProvider } from "./markdown-link-prompt";
+export { PageIcon } from "./native/chips";
+export type { MermaidDiagramProps } from "./native/code";
+export { CodeCopyButtonContext, MermaidDiagramContext } from "./native/code";
+export { RemoteMarkdownImage } from "./native/images";
+export { LinkifiedText } from "./native/linkified-text";
+export { useNativeLinkConfirm } from "./native/links";
+export { MarkdownLongPressContext } from "./native/sideways-scroll";

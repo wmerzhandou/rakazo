@@ -1,11 +1,20 @@
-import { Redirect, useLocalSearchParams, useRouter } from "expo-router";
-import { StatusBar } from "expo-status-bar";
-import { useEffect, useState } from "react";
+import { ph } from "@lingui/core/macro";
+import { useLingui } from "@lingui/react/macro";
+import { signInProviders } from "@rakazo/contracts";
+import {
+  credentialIssue,
+  MAX_PASSWORD_LENGTH,
+  PASSWORD_RULES,
+  suggestEmailCorrection,
+} from "@rakazo/core";
+import { fetchFresh } from "@rakazo/core/query";
+import { Redirect, useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
+import { useCallback, useContext, useEffect, useState } from "react";
 import {
   AccessibilityInfo,
+  ActivityIndicator,
   Keyboard,
   KeyboardAvoidingView,
-  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -15,42 +24,76 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import Svg, { Path } from "react-native-svg";
+import { NativeActionButton } from "../components/native/native-action-button";
+import { SocialSignInButtons } from "../components/settings/social-sign-in-buttons";
+import { currentApiBase } from "../lib/api/api";
+import { displayApiHost, usesCustomApiBase } from "../lib/api/endpoint";
+import { loadSessionToken } from "../lib/api/session";
+import { credentialIssueText, errorText } from "../lib/api/user-error";
+import type { PasswordResetCapabilities } from "../lib/auth/api-auth";
 import {
-  apiBaseWarning,
-  currentApiBase,
-  defaultApiBase,
-  displayApiHost,
-  loadSessionToken,
-  normalizeApiBase,
-  type PasswordResetCapabilities,
   passwordResetCapabilities,
-  probeApiBase,
   requestPasswordReset,
-  resetApiBase,
-  saveApiBase,
+  sendSignInCode,
   signIn,
+  signInWithCode,
   signUp,
-  usesCustomApiBase,
-} from "../lib/api";
-import { type AuthMode, initialAuthMode } from "../lib/auth-routing";
-import { useI18n } from "../lib/i18n";
+} from "../lib/auth/api-auth";
+import type { AuthMode } from "../lib/auth/auth-routing";
+import { initialAuthMode } from "../lib/auth/auth-routing";
+import { passkeysAvailable, signInWithPasskey } from "../lib/auth/passkey";
+import { continueWithSso } from "../lib/auth/sso";
+import { CallKeyboardContext } from "../lib/calls/call-keyboard-context";
+import { hasIncomingShare } from "../lib/composer/incoming-share";
+import { FORM_COLUMN_WIDTH } from "../lib/layout/adaptive-layout";
+import { useMobileTokens } from "../lib/native/native";
+import { queryClient, rpcQuery } from "../lib/query/query";
+import { confirmUnsentSendLoss } from "../lib/thread/send/unsent-send-warning";
+
+const CODE_LENGTH = 6;
 
 export default function SignIn() {
-  const { t } = useI18n();
+  const call = useContext(CallKeyboardContext);
+  const { t } = useLingui();
+  const tokens = useMobileTokens();
   const router = useRouter();
   const { mode: requestedMode } = useLocalSearchParams<{ mode?: string | string[] }>();
   const [mode, setMode] = useState<AuthMode>(() => initialAuthMode(requestedMode));
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
+  const [emailBlurred, setEmailBlurred] = useState(false);
+  const [warnedEmail, setWarnedEmail] = useState<string | null>(null);
+  const emailSuggestion = mode === "up" ? suggestEmailCorrection(email) : null;
   const [password, setPassword] = useState("");
+  const [passwordVisible, setPasswordVisible] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [ready, setReady] = useState(false);
   const [hasSession, setHasSession] = useState(false);
   const [apiBase, setApiBase] = useState(() => currentApiBase());
-  const [serverOpen, setServerOpen] = useState(false);
   const [reset, setReset] = useState<PasswordResetCapabilities | null>(null);
+  const [capabilityError, setCapabilityError] = useState(false);
+  const [capabilityAttempt, setCapabilityAttempt] = useState(0);
   const [resetSent, setResetSent] = useState(false);
+  const [code, setCode] = useState("");
+  const [codeSent, setCodeSent] = useState(false);
+  const [emailStep, setEmailStep] = useState(false);
+  const [passkeys, setPasskeys] = useState(false);
+
+  useEffect(() => {
+    setPasswordVisible(false);
+  }, [mode, apiBase]);
+
+  useEffect(() => {
+    setEmailStep(false);
+  }, [apiBase]);
+
+  useFocusEffect(
+    useCallback(() => {
+      setApiBase(currentApiBase());
+    }, []),
+  );
 
   useEffect(() => {
     void loadSessionToken().then((token) => {
@@ -62,62 +105,172 @@ export default function SignIn() {
   useEffect(() => {
     let active = true;
     setReset(null);
+    setCapabilityError(false);
+    // A code belongs to the server that sent it.
+    setCodeSent(false);
+    setCode("");
     void passwordResetCapabilities()
       .then((capabilities) => {
         if (active) setReset(capabilities);
       })
-      .catch(() => undefined);
+      .catch(() => {
+        if (active) setCapabilityError(true);
+      });
     return () => {
       active = false;
     };
-  }, [apiBase]);
+  }, [apiBase, capabilityAttempt]);
 
   useEffect(() => {
-    if (resetSent) AccessibilityInfo.announceForAccessibility(t("Check your email"));
-  }, [resetSent, t]);
+    let active = true;
+    setPasskeys(false);
+    void passkeysAvailable(reset).then((available) => {
+      if (active) setPasskeys(available);
+    });
+    return () => {
+      active = false;
+    };
+  }, [reset]);
+
+  useEffect(() => {
+    if (resetSent || codeSent) AccessibilityInfo.announceForAccessibility(t`Check your email`);
+  }, [resetSent, codeSent, t]);
 
   if (!ready) {
     return (
-      <View style={{ flex: 1, backgroundColor: "#F7F7F4", justifyContent: "center", padding: 24 }}>
-        <Text style={{ color: "#6E6E68", textAlign: "center" }}>{t("Loading…")}</Text>
+      <View
+        style={{
+          flex: 1,
+          backgroundColor: tokens.background,
+          justifyContent: "center",
+          padding: 24,
+        }}
+      >
+        <ActivityIndicator color={tokens.mutedForeground} accessibilityLabel={t`Loading…`} />
       </View>
     );
   }
-  if (hasSession) return <Redirect href="/" />;
+  if (hasSession) return <Redirect href={hasIncomingShare() ? "/share" : "/"} />;
 
-  async function submit() {
-    if (pending) return;
+  const providers = reset ? signInProviders(reset) : [];
+  const codeFlow = Boolean(reset?.passwordAuth && reset.emailCode && mode !== "forgot");
+  // A blank password asks for an emailed code, so code-only accounts need no toggle.
+  const usingCode = codeFlow && (codeSent || !password);
+  const codeStep = codeFlow && codeSent;
+  const chooser = Boolean(
+    reset?.passwordAuth && providers.length > 0 && !emailStep && mode !== "forgot" && !codeStep,
+  );
+  const presented = Boolean(
+    reset?.passwordAuth && providers.length > 0 && mode !== "forgot" && !codeStep && !resetSent,
+  );
+
+  async function submit(enteredCode = code) {
+    if (pending || !reset?.passwordAuth) return;
+    const issue = credentialIssue({
+      email,
+      password: mode === "forgot" || usingCode ? undefined : password,
+    });
+    if (issue) {
+      setError(credentialIssueText(issue));
+      return;
+    }
+    if (emailSuggestion && warnedEmail !== email) {
+      setWarnedEmail(email);
+      setEmailBlurred(true);
+      AccessibilityInfo.announceForAccessibility(
+        t`Did you mean ${ph({ email: emailSuggestion })}?`,
+      );
+      return;
+    }
+    // An unfinished code would spend one of the code's three attempts.
+    if (codeStep && enteredCode.length !== CODE_LENGTH) return;
     setPending(true);
     setError(null);
     try {
       if (mode === "forgot") {
         if (!reset?.passwordReset || !reset.resetUrl) {
-          throw new Error(t("Password recovery is not configured for this server"));
+          throw new Error(t`Password recovery is not configured for this server`);
         }
         await requestPasswordReset(email.trim(), reset.resetUrl);
         setResetSent(true);
         return;
       }
-      if (mode === "up") {
+      if (usingCode && !codeSent) {
+        const sentFrom = apiBase;
+        await sendSignInCode(email.trim());
+        if (currentApiBase() !== sentFrom) return;
+        setCode("");
+        setCodeSent(true);
+        return;
+      }
+      // Everything past this point saves new credentials, which deletes the unsent
+      // queue a server-rejected session kept; ask first, like a sign-out does.
+      if (!(await confirmUnsentSendLoss("sign-in"))) return;
+      if (usingCode) {
         const trimmedEmail = email.trim();
-        await signUp(trimmedEmail, password, name.trim() || trimmedEmail.split("@")[0] || "User");
+        await signInWithCode(
+          trimmedEmail,
+          enteredCode,
+          // Only used when this creates the account.
+          mode === "up" ? name.trim() || trimmedEmail.split("@")[0] || "User" : undefined,
+        );
+      } else if (mode === "up") {
+        const trimmedEmail = email.trim();
+        const result = await signUp(
+          trimmedEmail,
+          password,
+          name.trim() || trimmedEmail.split("@")[0] || "User",
+        );
+        if (result.verificationRequired) {
+          setResetSent(true);
+          return;
+        }
       } else {
         await signIn(email.trim(), password);
       }
-      router.replace("/");
+      await openApp();
     } catch (err) {
-      setError(err instanceof Error ? err.message : t("Could not continue"));
+      setError(errorText(err, t`Could not continue`));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  // Any sign-in can create the account (a code, SSO), so ask the server rather than the form.
+  async function openApp() {
+    if (hasIncomingShare()) return router.replace("/share");
+    const me = await fetchFresh(queryClient, rpcQuery("me")).catch(() => null);
+    router.replace(me?.needsSignupSurvey ? "/signup-survey" : "/");
+  }
+
+  function startProvider(provider: (typeof providers)[number]) {
+    return externalSignIn(() => continueWithSso("sign-in", provider.id));
+  }
+
+  async function externalSignIn(run: () => Promise<boolean>) {
+    if (pending) return;
+    setPending(true);
+    setError(null);
+    try {
+      // External sign-ins save credentials too, so the kept queue gets the same question;
+      // pending is already set, so the wait for the queue check cannot double-open it.
+      if (!(await confirmUnsentSendLoss("sign-in"))) return;
+      if (await run()) await openApp();
+    } catch (err) {
+      setError(errorText(err, t`Could not continue`));
     } finally {
       setPending(false);
     }
   }
 
   const custom = usesCustomApiBase(apiBase);
+  // Inside the card, fields take the page color: the muted fill matches the card.
+  const fieldBackground = presented ? tokens.background : tokens.muted;
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: "#F7F7F4" }}>
-      <StatusBar style="dark" />
+    <SafeAreaView style={{ flex: 1, backgroundColor: tokens.background }}>
       <KeyboardAvoidingView
+        enabled={!call}
         style={{ flex: 1 }}
         behavior={Platform.OS === "ios" ? "padding" : undefined}
       >
@@ -127,179 +280,421 @@ export default function SignIn() {
               contentContainerStyle={{
                 flexGrow: 1,
                 justifyContent: "center",
+                width: "100%",
+                maxWidth: FORM_COLUMN_WIDTH,
+                alignSelf: "center",
                 paddingHorizontal: 24,
                 paddingVertical: 24,
               }}
               keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
               keyboardShouldPersistTaps="handled"
             >
-              <Text
-                accessibilityRole="header"
-                style={{
-                  color: "#1B1B1E",
-                  fontSize: 32,
-                  fontWeight: "500",
-                  textAlign: "center",
-                }}
+              <View
+                style={
+                  presented
+                    ? {
+                        marginTop: 8,
+                        borderWidth: 1,
+                        borderColor: tokens.border,
+                        backgroundColor: tokens.card,
+                        borderRadius: 20,
+                        paddingHorizontal: 20,
+                        paddingVertical: 24,
+                      }
+                    : undefined
+                }
               >
-                {mode === "in"
-                  ? t("Sign in to Rakazo")
-                  : mode === "up"
-                    ? t("Sign up for Rakazo")
-                    : resetSent
-                      ? t("Check your email")
-                      : t("Reset your password")}
-              </Text>
-              {resetSent ? (
-                <View style={{ alignItems: "center", marginTop: 28 }}>
+                {presented && emailStep ? (
                   <Pressable
                     accessibilityRole="button"
+                    hitSlop={8}
                     onPress={() => {
-                      setMode("in");
-                      setResetSent(false);
+                      setError(null);
+                      setEmailStep(false);
                     }}
-                  >
-                    <Text style={{ color: "#1B1B1E", fontSize: 15, fontWeight: "600" }}>
-                      {t("Back to sign in")}
-                    </Text>
-                  </Pressable>
-                </View>
-              ) : (
-                <>
-                  {mode === "up" ? (
-                    <TextInput
-                      autoComplete="name"
-                      placeholder={t("Name")}
-                      placeholderTextColor="#8C8C86"
-                      value={name}
-                      onChangeText={setName}
-                      style={{
-                        marginTop: 28,
-                        backgroundColor: "#F1F1ED",
-                        borderRadius: 13,
-                        padding: 16,
-                        color: "#1B1B1E",
-                      }}
-                    />
-                  ) : null}
-                  <TextInput
-                    autoCapitalize="none"
-                    autoComplete="email"
-                    keyboardType="email-address"
-                    placeholder={t("Email")}
-                    placeholderTextColor="#8C8C86"
-                    value={email}
-                    onChangeText={setEmail}
                     style={{
-                      marginTop: mode === "up" ? 12 : 28,
-                      backgroundColor: "#F1F1ED",
-                      borderRadius: 13,
-                      padding: 16,
-                      color: "#1B1B1E",
-                    }}
-                  />
-                  {mode === "in" && reset?.passwordReset && reset.resetUrl ? (
-                    <Pressable
-                      accessibilityRole="button"
-                      hitSlop={8}
-                      onPress={() => {
-                        setMode("forgot");
-                        setError(null);
-                      }}
-                      style={{ alignSelf: "flex-end", marginTop: 10 }}
-                    >
-                      <Text style={{ color: "#1B1B1E", fontSize: 14, fontWeight: "600" }}>
-                        {t("Forgot password?")}
-                      </Text>
-                    </Pressable>
-                  ) : null}
-                  {mode !== "forgot" ? (
-                    <TextInput
-                      autoComplete={mode === "in" ? "current-password" : "new-password"}
-                      placeholder={t("Password")}
-                      placeholderTextColor="#8C8C86"
-                      returnKeyType="go"
-                      secureTextEntry
-                      value={password}
-                      onChangeText={setPassword}
-                      onSubmitEditing={() => void submit()}
-                      style={{
-                        marginTop: 12,
-                        backgroundColor: "#F1F1ED",
-                        borderRadius: 13,
-                        padding: 16,
-                        color: "#1B1B1E",
-                      }}
-                    />
-                  ) : null}
-                  {error ? <Text style={{ color: "#B91C1C", marginTop: 12 }}>{error}</Text> : null}
-                  <Pressable
-                    accessibilityRole="button"
-                    onPress={() => void submit()}
-                    disabled={pending}
-                    style={{
-                      marginTop: 16,
-                      backgroundColor: "#121215",
-                      borderRadius: 13,
-                      padding: 18,
-                      alignItems: "center",
-                    }}
-                  >
-                    <Text style={{ color: "#FBFBF9", fontSize: 17 }}>
-                      {pending
-                        ? t("Working…")
-                        : mode === "in"
-                          ? t("Sign in")
-                          : mode === "up"
-                            ? t("Sign up")
-                            : t("Send reset link")}
-                    </Text>
-                  </Pressable>
-                  <View
-                    style={{
+                      alignSelf: "flex-start",
                       flexDirection: "row",
-                      justifyContent: "center",
                       alignItems: "center",
-                      marginTop: 24,
+                      gap: 2,
+                      minHeight: 32,
+                      marginBottom: 8,
                     }}
                   >
-                    <Text style={{ color: "#8C8C86", fontSize: 15 }}>
-                      {mode === "in"
-                        ? t("Don’t have an account?")
-                        : mode === "up"
-                          ? t("Already have an account?")
-                          : ""}
+                    <Svg width={16} height={16} viewBox="0 0 24 24" fill="none">
+                      <Path
+                        d="M15 6 9 12l6 6"
+                        stroke={tokens.mutedForeground}
+                        strokeWidth={1.8}
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </Svg>
+                    <Text
+                      style={{ color: tokens.mutedForeground, fontSize: 15, fontWeight: "500" }}
+                    >
+                      {t`Back`}
                     </Text>
+                  </Pressable>
+                ) : null}
+                <Text
+                  accessibilityRole="header"
+                  style={{
+                    color: tokens.foreground,
+                    fontSize: 32,
+                    fontWeight: "500",
+                    textAlign: "center",
+                  }}
+                >
+                  {resetSent || codeStep
+                    ? t`Check your email`
+                    : chooser
+                      ? t`Welcome to Rakazo`
+                      : presented && mode === "in"
+                        ? t`Welcome back`
+                        : presented && mode === "up"
+                          ? t`Create your account`
+                          : mode === "in"
+                            ? t`Sign in to Rakazo`
+                            : mode === "up"
+                              ? t`Sign up for Rakazo`
+                              : t`Reset your password`}
+                </Text>
+                {chooser ? (
+                  <Text
+                    style={{
+                      color: tokens.mutedForeground,
+                      fontSize: 15,
+                      textAlign: "center",
+                      marginTop: 8,
+                    }}
+                  >
+                    {t`Persistent AI teammates that do real work`}
+                  </Text>
+                ) : null}
+                {resetSent ? (
+                  <View style={{ alignItems: "center", marginTop: 28 }}>
                     <Pressable
                       accessibilityRole="button"
-                      hitSlop={8}
                       onPress={() => {
-                        setMode((current) => (current === "in" ? "up" : "in"));
-                        setError(null);
+                        setMode("in");
+                        setResetSent(false);
+                        setCodeSent(false);
                       }}
-                      style={{ marginLeft: 5 }}
                     >
-                      <Text style={{ color: "#1B1B1E", fontSize: 15, fontWeight: "600" }}>
-                        {mode === "in"
-                          ? t("Sign up")
-                          : mode === "up"
-                            ? t("Sign in")
-                            : t("Back to sign in")}
+                      <Text style={{ color: tokens.foreground, fontSize: 15, fontWeight: "600" }}>
+                        {t`Back to sign in`}
                       </Text>
                     </Pressable>
                   </View>
-                </>
-              )}
+                ) : (
+                  <>
+                    {capabilityError ? (
+                      <View accessibilityRole="alert">
+                        <Text style={{ color: tokens.destructive }}>
+                          {t`Could not load sign-in options`}
+                        </Text>
+                        <NativeActionButton
+                          label={t`Retry`}
+                          onPress={() => setCapabilityAttempt((value) => value + 1)}
+                        />
+                      </View>
+                    ) : !reset ? (
+                      <ActivityIndicator
+                        color={tokens.mutedForeground}
+                        accessibilityLabel={t`Loading…`}
+                        style={{ marginTop: 16 }}
+                      />
+                    ) : null}
+                    {!reset?.passwordAuth && mode !== "forgot" ? (
+                      <SocialSignInButtons
+                        providers={providers}
+                        disabled={pending}
+                        onPress={(providerId) => {
+                          const provider = providers.find((item) => item.id === providerId);
+                          if (provider) void startProvider(provider);
+                        }}
+                      />
+                    ) : null}
+                    {error && !reset?.passwordAuth ? (
+                      <Text
+                        accessibilityRole="alert"
+                        style={{ color: tokens.destructive, marginTop: 12 }}
+                      >
+                        {error}
+                      </Text>
+                    ) : null}
+                    {reset?.passwordAuth && codeStep ? (
+                      <>
+                        <TextInput
+                          accessibilityLabel={t`Code`}
+                          autoComplete="one-time-code"
+                          autoFocus
+                          keyboardType="number-pad"
+                          maxLength={CODE_LENGTH}
+                          placeholder={t`Code`}
+                          placeholderTextColor={tokens.mutedForeground}
+                          textContentType="oneTimeCode"
+                          value={code}
+                          onChangeText={(value) => {
+                            const digits = value.replace(/\D/g, "").slice(0, CODE_LENGTH);
+                            setCode(digits);
+                            // iOS offers the code from Mail; a complete code signs in at once.
+                            if (digits.length === CODE_LENGTH) void submit(digits);
+                          }}
+                          onSubmitEditing={() => void submit()}
+                          style={{
+                            marginTop: 28,
+                            backgroundColor: fieldBackground,
+                            borderRadius: 13,
+                            padding: 16,
+                            color: tokens.foreground,
+                          }}
+                        />
+                        {error ? (
+                          <Text style={{ color: tokens.destructive, marginTop: 12 }}>{error}</Text>
+                        ) : null}
+                        <NativeActionButton
+                          disabled={pending || code.length < CODE_LENGTH}
+                          label={pending ? t`Working…` : t`Continue`}
+                          onPress={() => void submit()}
+                          style={{ marginTop: 16 }}
+                        />
+                        <NativeActionButton
+                          label={t`Back`}
+                          prominence="quiet"
+                          disabled={pending}
+                          onPress={() => {
+                            setCodeSent(false);
+                            setCode("");
+                            setError(null);
+                          }}
+                          style={{ alignSelf: "center", marginTop: 16 }}
+                        />
+                      </>
+                    ) : chooser ? (
+                      <>
+                        <SocialSignInButtons
+                          providers={providers}
+                          disabled={pending}
+                          onEmail={() => {
+                            setError(null);
+                            setEmailStep(true);
+                          }}
+                          onPasskey={
+                            passkeys ? () => void externalSignIn(signInWithPasskey) : undefined
+                          }
+                          onPress={(providerId) => {
+                            const provider = providers.find((item) => item.id === providerId);
+                            if (provider) void startProvider(provider);
+                          }}
+                        />
+                        {error ? (
+                          <Text
+                            accessibilityRole="alert"
+                            style={{ color: tokens.destructive, marginTop: 12 }}
+                          >
+                            {error}
+                          </Text>
+                        ) : null}
+                      </>
+                    ) : reset?.passwordAuth ? (
+                      <>
+                        {mode === "up" ? (
+                          <TextInput
+                            autoComplete="name"
+                            placeholder={t`Name`}
+                            placeholderTextColor={tokens.mutedForeground}
+                            value={name}
+                            onChangeText={setName}
+                            style={{
+                              marginTop: presented ? 20 : 28,
+                              backgroundColor: fieldBackground,
+                              borderRadius: 13,
+                              padding: 16,
+                              color: tokens.foreground,
+                            }}
+                          />
+                        ) : null}
+                        <TextInput
+                          autoCapitalize="none"
+                          autoComplete="email"
+                          keyboardType="email-address"
+                          placeholder={t`Email`}
+                          placeholderTextColor={tokens.mutedForeground}
+                          value={email}
+                          onChangeText={(value) => {
+                            setEmail(value);
+                            setEmailBlurred(false);
+                          }}
+                          onBlur={() => setEmailBlurred(true)}
+                          style={{
+                            marginTop: mode === "up" ? 12 : presented ? 20 : 28,
+                            backgroundColor: fieldBackground,
+                            borderRadius: 13,
+                            padding: 16,
+                            color: tokens.foreground,
+                          }}
+                        />
+                        {emailSuggestion && emailBlurred ? (
+                          <Pressable
+                            accessibilityRole="button"
+                            hitSlop={8}
+                            onPress={() => setEmail(emailSuggestion)}
+                            style={{ marginTop: 8, paddingHorizontal: 4 }}
+                          >
+                            <Text style={{ color: tokens.warning, fontSize: 14 }}>
+                              {t`Did you mean ${ph({ email: emailSuggestion })}?`}
+                            </Text>
+                          </Pressable>
+                        ) : null}
+                        {mode !== "forgot" ? (
+                          <View
+                            style={{
+                              marginTop: 12,
+                              flexDirection: "row",
+                              alignItems: "center",
+                              backgroundColor: fieldBackground,
+                              borderRadius: 13,
+                            }}
+                          >
+                            <TextInput
+                              autoComplete={mode === "in" ? "current-password" : "new-password"}
+                              textContentType={mode === "in" ? "password" : "newPassword"}
+                              passwordRules={mode === "in" ? undefined : PASSWORD_RULES}
+                              maxLength={MAX_PASSWORD_LENGTH}
+                              placeholder={t`Password`}
+                              placeholderTextColor={tokens.mutedForeground}
+                              returnKeyType="go"
+                              autoCapitalize="none"
+                              autoCorrect={false}
+                              secureTextEntry={!passwordVisible}
+                              value={password}
+                              onChangeText={setPassword}
+                              onSubmitEditing={() => void submit()}
+                              style={{
+                                flex: 1,
+                                minWidth: 0,
+                                padding: 16,
+                                color: tokens.foreground,
+                              }}
+                            />
+                            <NativeActionButton
+                              accessibilityLabel={
+                                passwordVisible ? t`Hide password` : t`Show password`
+                              }
+                              icon={{
+                                ios: passwordVisible ? "eye.slash" : "eye",
+                                android: passwordVisible ? "eye-off-outline" : "eye-outline",
+                              }}
+                              prominence="quiet"
+                              onPress={() => setPasswordVisible((visible) => !visible)}
+                              style={{
+                                alignSelf: "center",
+                                minWidth: 44,
+                                minHeight: 44,
+                                marginRight: 4,
+                              }}
+                            />
+                          </View>
+                        ) : null}
+                        {error ? (
+                          <Text style={{ color: tokens.destructive, marginTop: 12 }}>{error}</Text>
+                        ) : null}
+                        <NativeActionButton
+                          disabled={pending}
+                          label={
+                            pending
+                              ? t`Working…`
+                              : usingCode
+                                ? t`Continue`
+                                : mode === "in"
+                                  ? t`Sign in`
+                                  : mode === "up"
+                                    ? t`Sign up`
+                                    : t`Send reset link`
+                          }
+                          onPress={() => void submit()}
+                          style={{ marginTop: 16 }}
+                        />
+                        {passkeys && mode === "in" && !presented ? (
+                          <NativeActionButton
+                            label={t`Sign in with passkey`}
+                            icon={{ ios: "key.fill", android: "key-outline" }}
+                            prominence="secondary"
+                            fill
+                            disabled={pending}
+                            onPress={() => void externalSignIn(signInWithPasskey)}
+                            style={{ marginTop: 12 }}
+                          />
+                        ) : null}
+                        {mode === "in" && reset?.passwordReset && reset.resetUrl ? (
+                          <Pressable
+                            accessibilityRole="button"
+                            hitSlop={8}
+                            onPress={() => {
+                              setMode("forgot");
+                              setError(null);
+                            }}
+                            style={{ alignSelf: "center", marginTop: 16 }}
+                          >
+                            <Text
+                              style={{ color: tokens.foreground, fontSize: 14, fontWeight: "600" }}
+                            >
+                              {t`Forgot password?`}
+                            </Text>
+                          </Pressable>
+                        ) : null}
+                        <View
+                          style={{
+                            flexDirection: "row",
+                            justifyContent: "center",
+                            alignItems: "center",
+                            marginTop: 24,
+                          }}
+                        >
+                          <Text style={{ color: tokens.mutedForeground, fontSize: 15 }}>
+                            {mode === "in"
+                              ? t`Don’t have an account?`
+                              : mode === "up"
+                                ? t`Already have an account?`
+                                : ""}
+                          </Text>
+                          <Pressable
+                            accessibilityRole="button"
+                            hitSlop={8}
+                            onPress={() => {
+                              setMode((current) => (current === "in" ? "up" : "in"));
+                              setError(null);
+                            }}
+                            style={{ marginLeft: 5 }}
+                          >
+                            <Text
+                              style={{ color: tokens.foreground, fontSize: 15, fontWeight: "600" }}
+                            >
+                              {mode === "in"
+                                ? t`Sign up`
+                                : mode === "up"
+                                  ? t`Sign in`
+                                  : t`Back to sign in`}
+                            </Text>
+                          </Pressable>
+                        </View>
+                      </>
+                    ) : null}
+                  </>
+                )}
+              </View>
             </ScrollView>
             <Pressable
               accessibilityRole="button"
               accessibilityLabel={
                 custom
-                  ? t("Custom server {host}", { host: displayApiHost(apiBase) })
-                  : t("Use a custom server")
+                  ? t`Custom server ${ph({ host: displayApiHost(apiBase) })}`
+                  : t`Use a custom server`
               }
               hitSlop={12}
-              onPress={() => setServerOpen(true)}
+              onPress={() => router.push("/server")}
               style={{
                 alignItems: "center",
                 paddingHorizontal: 24,
@@ -309,165 +704,22 @@ export default function SignIn() {
             >
               {custom ? (
                 <>
-                  <Text style={{ color: "#A8A8A2", fontSize: 12 }}>{t("Custom server")}</Text>
-                  <Text style={{ color: "#6E6E68", fontSize: 13, marginTop: 2 }}>
+                  <Text style={{ color: tokens.mutedForeground, fontSize: 12 }}>
+                    {t`Custom server`}
+                  </Text>
+                  <Text style={{ color: tokens.mutedForeground, fontSize: 13, marginTop: 2 }}>
                     {displayApiHost(apiBase)}
                   </Text>
                 </>
               ) : (
-                <Text style={{ color: "#A8A8A2", fontSize: 13 }}>{t("Use a custom server")}</Text>
+                <Text style={{ color: tokens.mutedForeground, fontSize: 13 }}>
+                  {t`Use a custom server`}
+                </Text>
               )}
             </Pressable>
           </View>
         </TouchableWithoutFeedback>
       </KeyboardAvoidingView>
-      <ServerSheet
-        visible={serverOpen}
-        current={apiBase}
-        onClose={() => setServerOpen(false)}
-        onSaved={(url) => {
-          setApiBase(url);
-          setServerOpen(false);
-        }}
-      />
     </SafeAreaView>
-  );
-}
-
-function ServerSheet({
-  visible,
-  current,
-  onClose,
-  onSaved,
-}: {
-  visible: boolean;
-  current: string;
-  onClose: () => void;
-  onSaved: (url: string) => void;
-}) {
-  const { t } = useI18n();
-  const [draft, setDraft] = useState(current);
-  const [error, setError] = useState<string | null>(null);
-  const [pending, setPending] = useState(false);
-
-  useEffect(() => {
-    if (!visible) return;
-    setDraft(current);
-    setError(null);
-    setPending(false);
-  }, [visible, current]);
-
-  const parsedDraft = normalizeApiBase(draft);
-  const warning = parsedDraft.ok ? apiBaseWarning(parsedDraft.url) : null;
-
-  async function save() {
-    setPending(true);
-    setError(null);
-    try {
-      const probed = await probeApiBase(draft);
-      if (!probed.ok) {
-        setError(probed.error);
-        return;
-      }
-      const saved = await saveApiBase(probed.url);
-      if (!saved.ok) {
-        setError(saved.error);
-        return;
-      }
-      onSaved(saved.url);
-    } finally {
-      setPending(false);
-    }
-  }
-
-  async function restoreDefault() {
-    setPending(true);
-    setError(null);
-    try {
-      const saved = await resetApiBase();
-      if (!saved.ok) {
-        setError(saved.error);
-        return;
-      }
-      onSaved(saved.url);
-    } finally {
-      setPending(false);
-    }
-  }
-
-  return (
-    <Modal
-      visible={visible}
-      animationType="slide"
-      presentationStyle="pageSheet"
-      onRequestClose={onClose}
-    >
-      <KeyboardAvoidingView
-        style={{ flex: 1, backgroundColor: "#F7F7F4" }}
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
-      >
-        <SafeAreaView style={{ flex: 1, paddingHorizontal: 24, paddingTop: 12 }}>
-          <View
-            style={{
-              flexDirection: "row",
-              alignItems: "center",
-              justifyContent: "space-between",
-            }}
-          >
-            <Pressable onPress={onClose} hitSlop={8}>
-              <Text style={{ color: "#6E6E68", fontSize: 17 }}>{t("Cancel")}</Text>
-            </Pressable>
-            <Text style={{ color: "#1B1B1E", fontSize: 17, fontWeight: "600" }}>{t("Server")}</Text>
-            <Pressable onPress={() => void save()} disabled={pending} hitSlop={8}>
-              <Text style={{ color: "#1B1B1E", fontSize: 17, fontWeight: "600" }}>
-                {pending ? t("Checking…") : t("Save")}
-              </Text>
-            </Pressable>
-          </View>
-          <Text style={{ color: "#6E6E68", marginTop: 28, fontSize: 15, lineHeight: 22 }}>
-            {t(
-              "Point this app at your self-hosted Rakazo origin, the same HTTPS URL you open in a browser.",
-            )}
-          </Text>
-          <TextInput
-            autoCapitalize="none"
-            autoCorrect={false}
-            autoComplete="off"
-            keyboardType="url"
-            textContentType="URL"
-            returnKeyType="go"
-            onSubmitEditing={() => void save()}
-            placeholder={defaultApiBase()}
-            placeholderTextColor="#8C8C86"
-            value={draft}
-            onChangeText={(value) => {
-              setDraft(value);
-              setError(null);
-            }}
-            style={{
-              marginTop: 20,
-              backgroundColor: "#F1F1ED",
-              borderRadius: 13,
-              padding: 16,
-              color: "#1B1B1E",
-              fontSize: 16,
-            }}
-          />
-          {warning ? (
-            <Text style={{ color: "#8C8C86", marginTop: 12, fontSize: 13 }}>{warning}</Text>
-          ) : null}
-          {error ? <Text style={{ color: "#B91C1C", marginTop: 12 }}>{error}</Text> : null}
-          {usesCustomApiBase(current) || draft.trim() !== current ? (
-            <Pressable
-              onPress={() => void restoreDefault()}
-              disabled={pending}
-              style={{ marginTop: 28, alignItems: "center" }}
-            >
-              <Text style={{ color: "#6E6E68", fontSize: 15 }}>{t("Use default server")}</Text>
-            </Pressable>
-          ) : null}
-        </SafeAreaView>
-      </KeyboardAvoidingView>
-    </Modal>
   );
 }

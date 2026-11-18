@@ -1,224 +1,142 @@
-import { timingSafeEqual } from "node:crypto";
-import http from "node:http";
-import https from "node:https";
-import net from "node:net";
 import path from "node:path";
-import tls from "node:tls";
 import { lingui } from "@lingui/vite-plugin";
-import type { DesktopStackProbeResponse } from "@rakazo/contracts";
+import { buildIdAt } from "@rakazo/contracts/client-build";
+import {
+  COMPUTER_SCREEN_PREFIX,
+  COMPUTER_SCREEN_RUNTIME_PATH,
+  contentSecurityPolicyFor,
+} from "@rakazo/contracts/content-security-policy";
+import babel from "@rolldown/plugin-babel";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
-import { defineConfig, loadEnv, type PreviewServer, type ViteDevServer } from "vite";
-import { resolveScreenProxySecret } from "../../packages/core/src/secrets-guard.ts";
+import { defineConfig, loadEnv } from "vite";
+import { wuyingScreenAssets } from "../../packages/adapters/src/providers/computer/wuying/wuying-screen-assets.ts";
+import { wuyingScreenPolicy } from "../../packages/adapters/src/providers/computer/wuying/wuying-screen-policy.ts";
+import { createServiceLogger } from "../../packages/logging/src/env.ts";
+import { apiProxy } from "./server/api-proxy.js";
+import { withInstanceThemeLink } from "./server/instance-theme.js";
 import {
-  resolveNovncTarget,
-  safeProxyHeaders,
-  safeProxyResponseHeaders,
-  stripSensitiveHandshakeHeaders,
-} from "./src/screen-proxy.js";
+  attachDesktopStackProbe,
+  attachNovncProxy,
+  attachPreviewMiddleware,
+  sharedPageHeaders,
+  webServerSettings,
+} from "./server/preview-middleware.js";
+import { rakazoPwa } from "./server/pwa-plugin.js";
 
-const webPort = Number(process.env.WEB_PORT ?? 5173);
-const DESKTOP_STACK_PROBE_PATH = "/.well-known/rakazo-desktop-stack";
-const DESKTOP_STACK_TOKEN_HEADER = "x-rakazo-desktop-stack-token";
-
-function equalStackToken(expected: string, supplied: string | string[] | undefined) {
-  if (expected === "" || typeof supplied !== "string") return false;
-  const expectedBytes = Buffer.from(expected);
-  const suppliedBytes = Buffer.from(supplied);
-  return (
-    expectedBytes.byteLength === suppliedBytes.byteLength &&
-    timingSafeEqual(expectedBytes, suppliedBytes)
-  );
-}
-
-function attachDesktopStackProbe(
-  server: ViteDevServer | PreviewServer,
-  token: string,
-  imageTag: string,
-) {
-  server.middlewares.use((req, res, next) => {
-    if (req.url?.split("?", 1)[0] !== DESKTOP_STACK_PROBE_PATH) {
-      next();
-      return;
-    }
-    if (!equalStackToken(token, req.headers[DESKTOP_STACK_TOKEN_HEADER])) {
-      res.statusCode = 404;
-      res.end("Not found");
-      return;
-    }
-    const body: DesktopStackProbeResponse = { ok: true, imageTag };
-    res.statusCode = 200;
-    res.setHeader("cache-control", "no-store");
-    res.setHeader("content-type", "application/json; charset=utf-8");
-    res.end(JSON.stringify(body));
-  });
-}
-
-function attachNovncProxy(server: ViteDevServer | PreviewServer, secret: string) {
-  server.middlewares.use((req, res, next) => {
-    if (!req.url?.startsWith("/novnc/")) {
-      next();
-      return;
-    }
-    const target = resolveNovncTarget(req.url, secret);
-    if (!target) {
-      res.statusCode = 403;
-      res.end("Invalid or expired screen capability");
-      return;
-    }
-    const headers = {
-      ...safeProxyHeaders(req.headers),
-      host: `${target.hostname}:${target.port}`,
-    };
-    const transport = target.protocol === "https:" ? https : http;
-    const upstream = transport.request(
-      {
-        hostname: target.hostname,
-        port: target.port,
-        path: target.path,
-        method: req.method,
-        headers,
-        ...(target.protocol === "https:" ? { servername: target.hostname } : {}),
-      },
-      (incoming) => {
-        res.writeHead(incoming.statusCode ?? 502, {
-          ...safeProxyResponseHeaders(incoming.headers),
-          "access-control-allow-origin": "*",
-        });
-        incoming.pipe(res);
-      },
-    );
-    upstream.on("error", (error) => {
-      res.statusCode = 502;
-      res.end(error.message);
-    });
-    req.pipe(upstream);
-  });
-
-  server.httpServer?.on("upgrade", (req, socket, head) => {
-    if (!req.url?.startsWith("/novnc/")) return;
-    const target = resolveNovncTarget(req.url, secret);
-    if (!target) {
-      socket.destroy();
-      return;
-    }
-    const upstream =
-      target.protocol === "https:"
-        ? tls.connect({ port: target.port, host: target.hostname, servername: target.hostname })
-        : net.connect(target.port, target.hostname);
-    upstream.once(target.protocol === "https:" ? "secureConnect" : "connect", () => {
-      const headerLines = [
-        `${req.method ?? "GET"} ${target.path} HTTP/1.1`,
-        `Host: ${target.hostname}:${target.port}`,
-      ];
-      for (const [key, value] of Object.entries(safeProxyHeaders(req.headers))) {
-        headerLines.push(`${key}: ${Array.isArray(value) ? value.join(",") : value}`);
-      }
-      upstream.write(`${headerLines.join("\r\n")}\r\n\r\n`);
-      if (head.length) upstream.write(head);
-      socket.pipe(upstream);
-      const responseChunks: Buffer[] = [];
-      let responseSize = 0;
-      let responseTail = Buffer.alloc(0);
-      const forwardHandshake = (chunk: Buffer) => {
-        responseChunks.push(chunk);
-        responseSize += chunk.length;
-        if (responseSize > 64 * 1024) {
-          socket.destroy();
-          upstream.destroy();
-          return;
-        }
-        const boundarySearch = Buffer.concat([responseTail, chunk]);
-        if (boundarySearch.indexOf("\r\n\r\n") < 0) {
-          responseTail = Buffer.from(boundarySearch.subarray(-3));
-          return;
-        }
-        const responseHead = Buffer.concat(responseChunks, responseSize);
-        const safe = stripSensitiveHandshakeHeaders(responseHead);
-        if (!safe) {
-          socket.destroy();
-          upstream.destroy();
-          return;
-        }
-        upstream.off("data", forwardHandshake);
-        socket.write(safe);
-        upstream.pipe(socket);
-      };
-      upstream.on("data", forwardHandshake);
-    });
-    upstream.on("error", () => socket.destroy());
-    socket.on("error", () => upstream.destroy());
-  });
-}
-
-export default defineConfig(({ mode }) => {
+export default defineConfig(({ command, mode }) => {
+  // Names this build in every API request; the dev server has none, so the handshake stays off.
+  const buildId = command === "build" ? buildIdAt(new Date()) : "";
   const rootEnv = loadEnv(mode, path.resolve(import.meta.dirname, "../.."), "");
-  const api = process.env.API_PROXY_TARGET ?? rootEnv.API_PROXY_TARGET ?? "http://127.0.0.1:3100";
-  const previewHost = process.env.RAKAZO_HOST ?? rootEnv.RAKAZO_HOST ?? "localhost";
-  const screenProxySecret = () =>
-    resolveScreenProxySecret({
-      ...process.env,
-      SCREEN_PROXY_SECRET: process.env.SCREEN_PROXY_SECRET ?? rootEnv.SCREEN_PROXY_SECRET,
-      SANDBOX_SUPERVISOR_TOKEN:
-        process.env.SANDBOX_SUPERVISOR_TOKEN ?? rootEnv.SANDBOX_SUPERVISOR_TOKEN,
-      BETTER_AUTH_SECRET: process.env.BETTER_AUTH_SECRET ?? rootEnv.BETTER_AUTH_SECRET,
-    });
-  const performanceAssetDelayMs = Number(process.env.RAKAZO_PERFORMANCE_ASSET_DELAY_MS ?? 0);
-  const desktopStackToken =
-    process.env.RAKAZO_DESKTOP_STACK_TOKEN ?? rootEnv.RAKAZO_DESKTOP_STACK_TOKEN ?? "";
-  const imageTag = process.env.RAKAZO_IMAGE_TAG ?? rootEnv.RAKAZO_IMAGE_TAG ?? "edge";
+  const webPort = Number(process.env.WEB_PORT ?? rootEnv.WEB_PORT ?? 5173);
+  const settings = webServerSettings(
+    (name) => process.env[name] ?? rootEnv[name],
+    createServiceLogger({ service: "rakazo-web" }),
+  );
+  const { api, allowedHosts, appPolicy, instanceTheme } = settings;
+  // Set by the server built from this config; reusing one config object for two servers would
+  // leave the last one's list.
+  let proxyHosts: readonly string[] | true = [];
+  const proxy = apiProxy(api, () => proxyHosts);
   return {
-    plugins: [
-      react({
-        babel: {
-          plugins: ["@lingui/babel-plugin-lingui-macro"],
+    build: {
+      sourcemap: true,
+      rolldownOptions: {
+        output: {
+          codeSplitting: {
+            // Shared chunks that build schemas run before the entry chunk's body, so the Zod
+            // config only lands in time when it ships inside Zod's own chunk.
+            groups: [
+              { name: "zod", test: /[\\/]node_modules[\\/]zod[\\/]|[\\/]src[\\/]zod-config\.ts$/ },
+            ],
+          },
         },
-      }),
+      },
+    },
+    define: { "import.meta.env.RAKAZO_BUILD": JSON.stringify(buildId) },
+    plugins: [
+      {
+        // The API reads this to name the deployed build, and a tab fetches it to confirm the
+        // server already serves a newer build before it reloads.
+        name: "rakazo-build-id",
+        apply: "build",
+        generateBundle() {
+          this.emitFile({ type: "asset", fileName: "build-id", source: `${buildId}\n` });
+        },
+      },
+      react(),
+      babel({ plugins: ["@lingui/babel-plugin-lingui-macro"] }),
       lingui(),
       tailwindcss(),
+      rakazoPwa(buildId),
       {
-        name: "rakazo-desktop-stack-probe",
-        configureServer: (server) => attachDesktopStackProbe(server, desktopStackToken, imageTag),
-        configurePreviewServer: (server) =>
-          attachDesktopStackProbe(server, desktopStackToken, imageTag),
-      },
-      {
-        name: "rakazo-performance-asset-delay",
-        configurePreviewServer(server) {
-          if (!Number.isFinite(performanceAssetDelayMs) || performanceAssetDelayMs <= 0) return;
-          server.middlewares.use((req, _res, next) => {
+        // Dev keeps React Refresh unrestricted in app pages; screen documents always use CSP.
+        name: "rakazo-content-security-policy",
+        generateBundle() {
+          for (const [pathname, asset] of Object.entries(wuyingScreenAssets)) {
+            this.emitFile({ type: "asset", fileName: pathname.slice(1), source: asset.source });
+          }
+        },
+        configureServer(server) {
+          server.middlewares.use((req, res, next) => {
             const pathname = req.url?.split("?", 1)[0] ?? "/";
-            if (["/api", "/rpc", "/novnc"].some((prefix) => pathname.startsWith(prefix))) {
-              next();
+            if (pathname.startsWith(COMPUTER_SCREEN_PREFIX)) {
+              res.setHeader(
+                "content-security-policy",
+                contentSecurityPolicyFor(pathname, appPolicy, wuyingScreenPolicy)!,
+              );
+              if (pathname !== COMPUTER_SCREEN_RUNTIME_PATH)
+                res.setHeader("x-frame-options", "SAMEORIGIN");
+            }
+            const asset = Object.hasOwn(wuyingScreenAssets, pathname)
+              ? wuyingScreenAssets[pathname]
+              : undefined;
+            if (asset) {
+              res.setHeader("content-type", asset.type);
+              res.end(asset.source);
               return;
             }
-            setTimeout(next, performanceAssetDelayMs);
+            next();
+          });
+          server.middlewares.use(sharedPageHeaders);
+          if (instanceTheme) server.middlewares.use(instanceTheme);
+          attachDesktopStackProbe(server, settings);
+          // The hosts the running server allows, as Vite resolved them, for proxied upgrades.
+          proxyHosts = server.config.server.allowedHosts;
+          attachNovncProxy(server, settings);
+        },
+        configurePreviewServer(server) {
+          proxyHosts = server.config.preview.allowedHosts;
+          const { config } = server;
+          const outDir = path.resolve(config.root, config.build.outDir);
+          // Returned as a post hook, so it runs after Vite's SPA fallback has resolved the page.
+          return attachPreviewMiddleware(server, settings, {
+            root: config.root,
+            outDir,
+            assetsDir: path.join(outDir, config.build.assetsDir),
+            assetsUrl: `${config.base}${config.build.assetsDir}/`,
           });
         },
       },
       {
-        name: "rakazo-novnc-proxy",
-        configureServer: (server) => attachNovncProxy(server, screenProxySecret()),
-        configurePreviewServer: (server) => attachNovncProxy(server, screenProxySecret()),
+        // Without RAKAZO_THEME the page never links the theme, so the default deploy is unchanged.
+        name: "rakazo-instance-theme",
+        transformIndexHtml: (html) =>
+          command === "serve" && instanceTheme ? withInstanceThemeLink(html) : html,
       },
     ],
     server: {
-      host: "127.0.0.1",
+      host: process.env.RAKAZO_DEV_HOST ?? rootEnv.RAKAZO_DEV_HOST ?? "127.0.0.1",
       port: webPort,
       strictPort: true,
-      proxy: {
-        "/api": { target: api, changeOrigin: true },
-        "/rpc": { target: api, changeOrigin: true },
-      },
+      allowedHosts,
+      proxy,
     },
     preview: {
       host: "0.0.0.0",
-      port: Number(process.env.WEB_PORT ?? 5173),
-      allowedHosts: [previewHost],
-      proxy: {
-        "/api": { target: api, changeOrigin: true },
-        "/rpc": { target: api, changeOrigin: true },
-      },
+      port: webPort,
+      allowedHosts,
+      proxy,
     },
   };
 });
